@@ -21,6 +21,7 @@ import org.springframework.core.io.Resource;
 import org.springframework.util.ReflectionUtils;
 
 import java.io.FileInputStream;
+import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.lang.reflect.Field;
 import java.nio.file.*;
@@ -104,32 +105,50 @@ public class MybatisHotReloader implements InitializingBean, DisposableBean {
     for (WatchEvent<?> pollEvent : watchKey.pollEvents()) {
       Path path = (Path) pollEvent.context();
       Path changedFileAbsPath = baseDir.resolve(path).toAbsolutePath();
-      byte[] lastFileHash = mostRecentFileHash.getOrDefault(changedFileAbsPath, new byte[0]);
-      byte[] currentFileHash = getPathContentHash(changedFileAbsPath);
 
-      if(Arrays.equals(lastFileHash, currentFileHash)) {
-        log.info("Not reloading mapper - same file hash");
-        continue;
-      }
+      try {
+        byte[] lastFileHash = mostRecentFileHash.getOrDefault(changedFileAbsPath, new byte[0]);
+        Optional<byte[]> currentFileHash = getPathContentHash(changedFileAbsPath);
 
-      mostRecentFileHash.put(changedFileAbsPath, currentFileHash);
-      for (Resource resource : this.mapperLocations) {
-        Path resourceAbsPath = Paths.get(resource.getURI()).toAbsolutePath();
-        if (Objects.equals(resourceAbsPath, changedFileAbsPath)) {
-          log.info("Found mapper file to reload <{}>", resource.getURI());
-          this.reload(resourceAbsPath);
-          return;
+        if(!currentFileHash.isPresent()) {
+          log.trace("Empty mapper file <{}>", changedFileAbsPath);
+          continue;
         }
+
+        if (Arrays.equals(lastFileHash, currentFileHash.get())) {
+          log.info("Not reloading mapper - same file hash");
+          continue;
+        }
+
+        mostRecentFileHash.put(changedFileAbsPath, currentFileHash.get());
+        for (Resource resource : this.mapperLocations) {
+          Path resourceAbsPath = Paths.get(resource.getURI()).toAbsolutePath();
+          if (Objects.equals(resourceAbsPath, changedFileAbsPath)) {
+            log.info("Found mapper file to reload <{}>", resource.getURI());
+            this.reload(resourceAbsPath);
+            return;
+          }
+        }
+      } catch (FileNotFoundException e) {
+        // this may happen as file is first deleted from directory and then new one is written
+        log.trace("Mapper file not ready <{}>", changedFileAbsPath);
       }
     }
   }
 
-  private byte[] getPathContentHash(Path changedFileAbsPath) throws IOException {
+  private Optional<byte[]> getPathContentHash(Path changedFileAbsPath) throws IOException {
     try(FileInputStream fileInputStream = new FileInputStream(changedFileAbsPath.toFile())) {
       byte[] fileContent = IOUtils.toByteArray(fileInputStream);
-      return Hashing.sha1()
-        .hashBytes(fileContent)
-        .asBytes();
+      // this may happen when file wasn't written yet or is actually empty
+      // there is no need to reload empty file, so let's ignore that edge case
+      if(fileContent.length == 0) {
+        return Optional.empty();
+      }
+
+      return Optional.ofNullable(
+        Hashing.sha1()
+          .hashBytes(fileContent)
+          .asBytes());
     }
   }
 
