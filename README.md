@@ -1,10 +1,10 @@
 # mybatis-hotreloader
 
 The goal of this project is to autoreload changed mybatis mapper files. 
-Current version is experimental and by any means safe to run in production.
+Current version is experimental and by no means safe to run in production.
 
 ## How to use:
-In your spring configuration declare bean:
+In your spring configuration declare a bean:
 ```
   @Bean
   public MybatisHotReloader hotreloader(SqlSessionFactory sqlSessionFactory) {
