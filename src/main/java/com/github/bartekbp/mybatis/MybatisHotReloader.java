@@ -26,9 +26,7 @@ import java.io.IOException;
 import java.lang.reflect.Field;
 import java.nio.file.*;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.*;
 
 @RequiredArgsConstructor
 @Slf4j
@@ -42,6 +40,35 @@ public class MybatisHotReloader implements InitializingBean, DisposableBean {
   private ExecutorService executor;
   private Map<Path, byte[]> mostRecentFileHash = new ConcurrentHashMap<>();
   private Collection<Class<?>> mapperClasses;
+
+  private static class DelayedPath implements Delayed {
+    public DelayedPath(Path path, long delayMilis) {
+      this.path = path;
+      this.endTime = System.currentTimeMillis() + delayMilis;
+    }
+
+    private Path path;
+    private long endTime;
+
+    public Path getPath() {
+      return path;
+    }
+
+    @Override
+    public long getDelay(TimeUnit unit) {
+      return unit.convert(this.endTime - System.currentTimeMillis(), TimeUnit.MILLISECONDS);
+    }
+
+    @Override
+    public int compareTo(Delayed o) {
+      DelayedPath other = (DelayedPath) o;
+      return Comparator.<DelayedPath>comparingLong(delayed -> delayed.endTime)
+        .thenComparing(DelayedPath::getPath)
+        .compare(this, other);
+    }
+  }
+
+  private DelayQueue<DelayedPath> pathsToRevisit = new DelayQueue<>();
 
   public void afterPropertiesSet() throws Exception {
     addStatementLock();
@@ -59,16 +86,29 @@ public class MybatisHotReloader implements InitializingBean, DisposableBean {
     for (Resource resource : mapperLocations) {
       Paths.get(resource.getURI())
         .getParent()
-        .register(watchService, StandardWatchEventKinds.ENTRY_CREATE);
+        .register(watchService, StandardWatchEventKinds.ENTRY_MODIFY);
     }
 
     this.executor.execute(() -> {
       while(!Thread.interrupted()) {
-        this.watchFiles();
+        this.reloadChangedFiles();
+        this.reloadDelayedPaths();
       }
 
       log.info("Stopped watching mappers");
     });
+  }
+
+  private void reloadDelayedPaths() {
+    try {
+      List<DelayedPath> readyPaths = new ArrayList<>();
+      this.pathsToRevisit.drainTo(readyPaths);
+      for(DelayedPath path: readyPaths) {
+        this.reloadIfChanged(path.getPath(), true);
+      }
+    } catch (Exception e) {
+      log.error("Error while refreshing mappers", e);
+    }
   }
 
   private Object getLock() {
@@ -88,8 +128,12 @@ public class MybatisHotReloader implements InitializingBean, DisposableBean {
   }
 
   @SneakyThrows
-  private void watchFiles() {
-    WatchKey watchKey = watchService.take();
+  private void reloadChangedFiles() {
+    WatchKey watchKey = watchService.poll(100, TimeUnit.MILLISECONDS);
+    if(watchKey == null) {
+      return;
+    }
+
     try {
       onPathChange(watchKey);
     } catch (Exception e) {
@@ -104,36 +148,54 @@ public class MybatisHotReloader implements InitializingBean, DisposableBean {
     Path baseDir = (Path) watchKey.watchable();
     for (WatchEvent<?> pollEvent : watchKey.pollEvents()) {
       Path path = (Path) pollEvent.context();
-      Path changedFileAbsPath = baseDir.resolve(path).toAbsolutePath();
+      Path absPath = baseDir.resolve(path).toAbsolutePath();
 
-      try {
-        byte[] lastFileHash = mostRecentFileHash.getOrDefault(changedFileAbsPath, new byte[0]);
-        Optional<byte[]> currentFileHash = getPathContentHash(changedFileAbsPath);
-
-        if(!currentFileHash.isPresent()) {
-          log.trace("Empty mapper file <{}>", changedFileAbsPath);
-          continue;
-        }
-
-        if (Arrays.equals(lastFileHash, currentFileHash.get())) {
-          log.info("Not reloading mapper - same file hash");
-          continue;
-        }
-
-        mostRecentFileHash.put(changedFileAbsPath, currentFileHash.get());
-        for (Resource resource : this.mapperLocations) {
-          Path resourceAbsPath = Paths.get(resource.getURI()).toAbsolutePath();
-          if (Objects.equals(resourceAbsPath, changedFileAbsPath)) {
-            log.info("Found mapper file to reload <{}>", resource.getURI());
-            this.reload(resourceAbsPath);
-            return;
-          }
-        }
-      } catch (FileNotFoundException e) {
-        // this may happen as file is first deleted from directory and then new one is written
-        log.trace("Mapper file not ready <{}>", changedFileAbsPath);
+      boolean reloadedFile = this.reloadIfChanged(absPath, false);
+      if(reloadedFile) {
+        return;
       }
     }
+  }
+
+  @SneakyThrows
+  private boolean reloadIfChanged(Path path, boolean reloadedBefore) {
+    try {
+      byte[] lastFileHash = mostRecentFileHash.getOrDefault(path, new byte[0]);
+      Optional<byte[]> currentFileHash = getPathContentHash(path);
+
+      if(!currentFileHash.isPresent()) {
+        log.trace("Empty mapper file <{}>", path);
+        if(!reloadedBefore) {
+          pathsToRevisit.add(new DelayedPath(path, 100));
+        }
+
+        return false;
+      }
+
+      if (Arrays.equals(lastFileHash, currentFileHash.get())) {
+        log.trace("Not reloading mapper - same file hash");
+        return false;
+      }
+
+      mostRecentFileHash.put(path, currentFileHash.get());
+      for (Resource resource : this.mapperLocations) {
+        Path resourceAbsPath = Paths.get(resource.getURI()).toAbsolutePath();
+        if (Objects.equals(resourceAbsPath, path)) {
+          log.info("Found mapper file to reload <{}>", resource.getURI());
+          this.reload(resourceAbsPath);
+          return true;
+        }
+      }
+    } catch (FileNotFoundException e) {
+      // this may happen as file is first deleted from directory and then new one is written
+      log.trace("Mapper file not ready <{}>", path);
+
+      if(!reloadedBefore) {
+        pathsToRevisit.add(new DelayedPath(path, 100));
+      }
+    }
+
+    return false;
   }
 
   private Optional<byte[]> getPathContentHash(Path changedFileAbsPath) throws IOException {
